@@ -1,7 +1,8 @@
 [package]
-edition = "2021"
+edition = "2024"
 name = "autodoggo"
-version = "0.1.0"
+rust-version = "1.88"
+version      = "0.1.0"
 
 [[bin]]
 name = "autodoggo"
@@ -10,29 +11,43 @@ test = false
 bench = false
 
 [dependencies]
-critical-section = "1.2.0"
-embassy-net = { version = "0.6.0", features = [
+esp-hal = { version = "~1.1.0", features = ["defmt", "esp32", "unstable"] }
+
+esp-rtos = { version = "0.3.0", features = [
+  "defmt",
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32",
+] }
+
+defmt                  = "1.0.1"
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32"] }
+
+embassy-net = { version = "0.9.1", features = [
+  "defmt",
   "dhcpv4",
   "medium-ethernet",
   "tcp",
   "udp",
+  "dns",
 ] }
-embedded-io = "0.6.1"
-esp-alloc = "0.7.0"
-esp-hal = { version = "1.0.0-beta.0", features = ["esp32", "unstable"] }
-blocking-network-stack = { git = "https://github.com/bjoernQ/blocking-network-stack.git", rev = "b3ecefc222d8806edd221f266999ca339c52d34e" }
-esp-println = { version = "0.13.0", features = ["esp32", "log"] }
-esp-wifi = { version = "0.13.0", features = [
-  "builtin-scheduler",
+embedded-io = { version = "0.7.1", features = ["defmt"] }
+embedded-io-async = { version = "0.7.0", features = ["defmt"] }
+esp-alloc = { version = "0.10.0", features = ["defmt"] }
+esp-println = { version = "0.17.0", features = ["defmt-espflash", "esp32"] }
+# for more networking protocol support see https://crates.io/crates/edge-net
+embassy-executor = { version = "0.10.0", features = ["defmt"] }
+embassy-time = { version = "0.5.0", features = ["defmt"] }
+esp-radio = { version = "0.18.0", features = [
+  "defmt",
   "esp-alloc",
   "esp32",
-  "log",
+  "unstable",
   "wifi",
-  "smoltcp",
 ] }
-heapless = { version = "0.8.0", default-features = false }
-log = { version = "0.4.21" }
-smoltcp = { version = "0.12.0", default-features = false, features = [
+smoltcp = { version = "0.13.0", default-features = false, features = [
+  "defmt",
   "medium-ethernet",
   "multicast",
   "proto-dhcpv4",
@@ -44,7 +59,10 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
   "socket-tcp",
   "socket-udp",
 ] }
-picoserve = { version = "0.15.1", features = ["embassy"] }
+reqwless = { version = "0.14.0", default-features = false }
+
+critical-section = "1.2.0"
+static_cell      = "2.1.1"
 
 [profile.dev]
 # Rust debug is too slow.
@@ -54,11 +72,8 @@ opt-level = "s"
 [profile.release]
 codegen-units = 1        # LLVM can perform better optimizations using a single thread
 debug = 2
-debug-assertions = false
-incremental = false
 lto = 'fat'
 opt-level = 's'
-overflow-checks = false
 
 [build-dependencies]
 dotenv = "0.15.0"
