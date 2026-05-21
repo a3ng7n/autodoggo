@@ -14,9 +14,22 @@ use embassy_net::{
     tcp::client::{TcpClient, TcpClientState},
     Runner, Stack, StackResources,
 };
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Duration, Timer};
 use esp_println::println;
-use esp_hal::{Blocking, analog::adc::AdcPin, clock::CpuClock, peripherals::{ADC1, GPIO34}};
+use esp_hal::{
+    Blocking,
+    analog::adc::AdcPin,
+    clock::CpuClock,
+    gpio::{DriveMode, Input, InputConfig, Pull},
+    ledc::{
+        LSGlobalClkSource, Ledc, LowSpeed,
+        channel::{self, ChannelIFace},
+        timer::{self, TimerIFace},
+    },
+    peripherals::{ADC1, GPIO34},
+    time::Rate,
+};
 use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::wifi::{
@@ -56,6 +69,16 @@ macro_rules! mk_static {
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
+const DEBOUNCE_MS: u64 = 50;
+
+// GPIO18 = PWM output A, GPIO27 = PWM output B
+// GPIO19 = ramp button, GPIO21 = pin-select button
+#[derive(Clone, Copy)]
+enum RampDir { Up, Down }
+
+static RAMP_CMD: Signal<CriticalSectionRawMutex, RampDir> = Signal::new();
+static PIN_SEL:  Signal<CriticalSectionRawMutex, bool>    = Signal::new();
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -74,6 +97,11 @@ async fn main(spawner: Spawner) -> ! {
     let sw_interrupt =
         esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
+    
+    let btn1 = Input::new(peripherals.GPIO19, InputConfig::default().with_pull(Pull::Up));
+    let btn2 = Input::new(peripherals.GPIO21, InputConfig::default().with_pull(Pull::Up));
+    spawner.spawn(button1_task(btn1).unwrap());
+    spawner.spawn(button2_task(btn2).unwrap());
 
     let station_config = Config::Station(
         StationConfig::default()
@@ -92,7 +120,6 @@ async fn main(spawner: Spawner) -> ! {
 
     let rng = Rng::new();
     let net_seed = rng.random() as u64 | ((rng.random() as u64) << 32);
-    let tls_seed = rng.random() as u64 | ((rng.random() as u64) << 32);
 
     let (stack, runner) = embassy_net::new(
         wifi_interface,
@@ -129,32 +156,83 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(adc_read(adc1, pin).unwrap());
 
+    // LEDC timer in static storage so Channel can hold a 'static reference to it
+    let mut ledc = Ledc::new(peripherals.LEDC);
+    ledc.set_global_slow_clock(LSGlobalClkSource::APBClk);
+    let lstimer0 = mk_static!(timer::Timer<'static, LowSpeed>, {
+        let mut t = ledc.timer::<LowSpeed>(timer::Number::Timer0);
+        t.configure(timer::config::Config {
+            duty: timer::config::Duty::Duty8Bit,
+            clock_source: timer::LSClockSource::APBClk,
+            frequency: Rate::from_khz(1),
+        }).unwrap();
+        t
+    });
+    let mut ch_a = ledc.channel::<LowSpeed>(channel::Number::Channel0, peripherals.GPIO18);
+    ch_a.configure(channel::config::Config {
+        timer: lstimer0,
+        duty_pct: 0,
+        drive_mode: DriveMode::PushPull,
+    }).unwrap();
+    let mut ch_b = ledc.channel::<LowSpeed>(channel::Number::Channel1, peripherals.GPIO27);
+    ch_b.configure(channel::config::Config {
+        timer: lstimer0,
+        duty_pct: 0,
+        drive_mode: DriveMode::PushPull,
+    }).unwrap();
+
+    let mut duty: u8 = 0;
+    let mut use_a = true;
+
+    enum RampState { Idle, Up, Down }
+    let mut ramp_state = RampState::Idle;
+
     loop {
-        println!("Making HTTP request");
+        Timer::after(Duration::from_millis(10)).await;
 
-        let mut client = HttpClient::new(&tcp_client, &dns_client);
-        let mut rx_buf = [0u8; 4096];
-
-        let request = client
-            .request(Method::GET, "http://www.mobile-j.de/")
-            .await
-            .unwrap();
-        let mut request = request.headers(&[("Connection", "close")]);
-
-        let response = request.send(&mut rx_buf).await.unwrap();
-        match response.body().read_to_end().await {
-            Ok(data) => {
-                if let Ok(body) = core::str::from_utf8(data) {
-                    println!("Body: {}", body);
-                }
-            }
-            Err(err) => println!("Body error: {:?}", err),
+        if let Some(dir) = RAMP_CMD.try_take() {
+            ramp_state = match dir {
+                RampDir::Up   => RampState::Up,
+                RampDir::Down => RampState::Down,
+            };
         }
 
-        Timer::after(Duration::from_secs(5)).await;
-    }
+        if let Some(sel) = PIN_SEL.try_take() {
+            let prev = use_a;
+            use_a = sel;
+            if prev != use_a {
+                if use_a {
+                    ch_a.set_duty(duty).unwrap();
+                    ch_b.set_duty(0).unwrap();
+                } else {
+                    ch_a.set_duty(0).unwrap();
+                    ch_b.set_duty(duty).unwrap();
+                }
+            }
+        }
 
-    // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/esp-hal-v1.1.0/examples
+        match ramp_state {
+            RampState::Idle => {}
+            RampState::Up => {
+                if duty < 100 {
+                    duty += 1;
+                    if use_a { ch_a.set_duty(duty).unwrap(); }
+                    else      { ch_b.set_duty(duty).unwrap(); }
+                } else {
+                    ramp_state = RampState::Idle;
+                }
+            }
+            RampState::Down => {
+                if duty > 0 {
+                    duty -= 1;
+                    if use_a { ch_a.set_duty(duty).unwrap(); }
+                    else      { ch_b.set_duty(duty).unwrap(); }
+                } else {
+                    ramp_state = RampState::Idle;
+                }
+            }
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -195,4 +273,33 @@ async fn connection(mut controller: WifiController<'static>) {
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
     runner.run().await
+}
+
+#[embassy_executor::task]
+async fn button1_task(mut button: Input<'static>) {
+    loop {
+        button.wait_for_falling_edge().await;
+        Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+        if button.is_low() {
+            RAMP_CMD.signal(RampDir::Up);
+        }
+        button.wait_for_rising_edge().await;
+        Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+        RAMP_CMD.signal(RampDir::Down);
+    }
+}
+
+#[embassy_executor::task]
+async fn button2_task(mut button: Input<'static>) {
+    let mut use_a = true;
+    loop {
+        button.wait_for_falling_edge().await;
+        Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+        if button.is_low() {
+            use_a = !use_a;
+            PIN_SEL.signal(use_a);
+        }
+        button.wait_for_rising_edge().await;
+        Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
+    }
 }
