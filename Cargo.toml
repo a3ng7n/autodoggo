@@ -64,6 +64,7 @@ reqwless = { version = "0.14.0", default-features = false }
 embassy-sync     = { version = "0.6", features = ["defmt"] }
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
+esp-backtrace = { version = "0.19.0", features = ["defmt", "esp32", "panic-handler"] }
 
 [profile.dev]
 # Rust debug is too slow.
