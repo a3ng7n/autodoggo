@@ -83,8 +83,8 @@ enum PulleyState { Hold, RampingUpCCW, DrivingCCW, RampingDownCCW, RampingUpCW, 
 
 static DOOR_CMD: Signal<CriticalSectionRawMutex, DoorCommand> = Signal::new();
 static PULLEY_CMD: Signal<CriticalSectionRawMutex, PulleyCommand> = Signal::new();
-static OPEN_LIMIT_HIT: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-static CLOSE_LIMIT_HIT: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static OPEN_LIMIT_HIT: Signal<CriticalSectionRawMutex, bool> = Signal::new();
+static CLOSE_LIMIT_HIT: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 static OVERCURRENT_DETECTED: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 type AdcPinType = GPIO33<'static>;
@@ -262,16 +262,17 @@ async fn close_button_task(mut button: Input<'static>) {
 }
 
 #[embassy_executor::task(pool_size = 2)]
-async fn limit_switch_task(mut limit_switch: Input<'static>, limit_signal: &'static Signal<CriticalSectionRawMutex, ()>) {
+async fn limit_switch_task(mut limit_switch: Input<'static>, limit_signal: &'static Signal<CriticalSectionRawMutex, bool>) {
     info!("Starting limit switch task for {:?}", limit_switch);
     loop {
         limit_switch.wait_for_falling_edge().await; 
         Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
         if limit_switch.is_low(){
-            limit_signal.signal(());
+            limit_signal.signal(true);
             info!("Limit switch hit: {:?}", limit_switch);
         }
         limit_switch.wait_for_rising_edge().await;
+        limit_signal.signal(false);
         Timer::after(Duration::from_millis(DEBOUNCE_MS)).await;
     }
 }
@@ -327,9 +328,11 @@ async fn door_state_machine_task() {
                     timeout = Instant::now() + Duration::from_millis(DOOR_TIMEOUT_MS);
                 }
 
-                if let Some(_) = OPEN_LIMIT_HIT.try_take() {
-                    state = DoorState::Opened;
-                    info!("Door: Opening->Opened (limit)");
+                if let Some(limit_hit) = OPEN_LIMIT_HIT.try_take() {
+                    if limit_hit {
+                        state = DoorState::Opened;
+                        info!("Door: Opening->Opened (limit)");
+                    }
                 } else if let Some(cmd) = DOOR_CMD.try_take() {
                     if cmd == DoorCommand::Close {
                         state = DoorState::Closing;
@@ -365,9 +368,11 @@ async fn door_state_machine_task() {
                     timeout = Instant::now() + Duration::from_millis(DOOR_TIMEOUT_MS);
                 }
 
-                if let Some(_) = CLOSE_LIMIT_HIT.try_take() {
-                    state = DoorState::Closed;
-                    info!("Door: Closing->Closed (limit)");
+                if let Some(limit_hit) = CLOSE_LIMIT_HIT.try_take() {
+                    if limit_hit {
+                        state = DoorState::Closed;
+                        info!("Door: Closing->Closed (limit)");
+                    }
                 } else if let Some(cmd) = DOOR_CMD.try_take() {
                     if cmd == DoorCommand::Open {
                         state = DoorState::Opening;
